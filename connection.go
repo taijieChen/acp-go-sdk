@@ -76,6 +76,11 @@ type Connection struct {
 	// notificationQueue serializes notification processing to maintain order.
 	// It is bounded to keep memory usage predictable.
 	notificationQueue chan *anyMessage
+
+	// sessionSeq tracks per-session sequence numbers for notifications that
+	// need stable ordering hints (e.g. "session/update" from agents).
+	sessionSeqMu sync.Mutex
+	sessionSeq   map[string]uint64
 }
 
 func NewConnection(handler MethodHandler, peerInput io.Writer, peerOutput io.Reader) *Connection {
@@ -93,6 +98,7 @@ func NewConnection(handler MethodHandler, peerInput io.Writer, peerOutput io.Rea
 		inboundCtx:          inboundCtx,
 		inboundCancel:       inboundCancel,
 		notificationQueue:   make(chan *anyMessage, defaultMaxQueuedNotifications),
+		sessionSeq:          make(map[string]uint64),
 	}
 	go c.sendCancelRequests()
 	go c.receive()
@@ -766,6 +772,13 @@ func (c *Connection) SendNotification(ctx context.Context, method string, params
 	default:
 	}
 
+	// For agent session updates, automatically inject a monotonically
+	// increasing sequence number into the notification metadata so
+	// clients can reconstruct the relative ordering of streamed chunks.
+	if method == ClientMethodSessionUpdate {
+		params = c.withSessionSeq(params)
+	}
+
 	msg, err := c.prepareNotification(method, params)
 	if err != nil {
 		return err
@@ -775,6 +788,115 @@ func (c *Connection) SendNotification(ctx context.Context, method string, params
 		return NewInternalError(map[string]any{"error": err.Error()})
 	}
 	return nil
+}
+
+// withSessionSeq attaches a per-session monotonic sequence number to
+// SessionNotification.Meta["seq"]. For unknown param types it returns
+// the input unchanged.
+func (c *Connection) withSessionSeq(params any) any {
+	switch p := params.(type) {
+	case SessionNotification:
+		// Work on a copy and return the updated value.
+		c.addSessionSeq(&p)
+		return p
+	case *SessionNotification:
+		if p == nil {
+			return params
+		}
+		c.addSessionSeq(p)
+		return params
+	default:
+		return params
+	}
+}
+
+// addSessionSeq increments and writes the next sequence number for the
+// given session into the notification's Meta map.
+func (c *Connection) addSessionSeq(n *SessionNotification) {
+	sid := string(n.SessionId)
+	if sid == "" {
+		return
+	}
+
+	c.sessionSeqMu.Lock()
+	seq := c.sessionSeq[sid] + 1
+	c.sessionSeq[sid] = seq
+	c.sessionSeqMu.Unlock()
+
+	if n.Meta == nil {
+		n.Meta = make(map[string]any)
+	}
+	// Always overwrite any existing value to ensure a canonical sequence.
+	n.Meta["seq"] = seq
+
+	// 同步将 seq 写入具体的 SessionUpdate 变体的 Meta，方便业务方
+	// 直接从 chunk 级别的 Meta 中读取顺序号。
+	if n.Update.UserMessageChunk != nil {
+		if n.Update.UserMessageChunk.Meta == nil {
+			n.Update.UserMessageChunk.Meta = make(map[string]any)
+		}
+		n.Update.UserMessageChunk.Meta["seq"] = seq
+	}
+	if n.Update.AgentMessageChunk != nil {
+		if n.Update.AgentMessageChunk.Meta == nil {
+			n.Update.AgentMessageChunk.Meta = make(map[string]any)
+		}
+		n.Update.AgentMessageChunk.Meta["seq"] = seq
+	}
+	if n.Update.AgentThoughtChunk != nil {
+		if n.Update.AgentThoughtChunk.Meta == nil {
+			n.Update.AgentThoughtChunk.Meta = make(map[string]any)
+		}
+		n.Update.AgentThoughtChunk.Meta["seq"] = seq
+	}
+	if n.Update.ToolCall != nil {
+		if n.Update.ToolCall.Meta == nil {
+			n.Update.ToolCall.Meta = make(map[string]any)
+		}
+		n.Update.ToolCall.Meta["seq"] = seq
+	}
+	if n.Update.ToolCallUpdate != nil {
+		if n.Update.ToolCallUpdate.Meta == nil {
+			n.Update.ToolCallUpdate.Meta = make(map[string]any)
+		}
+		n.Update.ToolCallUpdate.Meta["seq"] = seq
+	}
+	if n.Update.Plan != nil {
+		if n.Update.Plan.Meta == nil {
+			n.Update.Plan.Meta = make(map[string]any)
+		}
+		n.Update.Plan.Meta["seq"] = seq
+	}
+	if n.Update.AvailableCommandsUpdate != nil {
+		if n.Update.AvailableCommandsUpdate.Meta == nil {
+			n.Update.AvailableCommandsUpdate.Meta = make(map[string]any)
+		}
+		n.Update.AvailableCommandsUpdate.Meta["seq"] = seq
+	}
+	if n.Update.CurrentModeUpdate != nil {
+		if n.Update.CurrentModeUpdate.Meta == nil {
+			n.Update.CurrentModeUpdate.Meta = make(map[string]any)
+		}
+		n.Update.CurrentModeUpdate.Meta["seq"] = seq
+	}
+	if n.Update.ConfigOptionUpdate != nil {
+		if n.Update.ConfigOptionUpdate.Meta == nil {
+			n.Update.ConfigOptionUpdate.Meta = make(map[string]any)
+		}
+		n.Update.ConfigOptionUpdate.Meta["seq"] = seq
+	}
+	if n.Update.SessionInfoUpdate != nil {
+		if n.Update.SessionInfoUpdate.Meta == nil {
+			n.Update.SessionInfoUpdate.Meta = make(map[string]any)
+		}
+		n.Update.SessionInfoUpdate.Meta["seq"] = seq
+	}
+	if n.Update.UsageUpdate != nil {
+		if n.Update.UsageUpdate.Meta == nil {
+			n.Update.UsageUpdate.Meta = make(map[string]any)
+		}
+		n.Update.UsageUpdate.Meta["seq"] = seq
+	}
 }
 
 func (c *Connection) prepareNotification(method string, params any) (anyMessage, error) {

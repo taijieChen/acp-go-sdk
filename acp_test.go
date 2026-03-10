@@ -1036,6 +1036,112 @@ func TestPromptWaitsForSessionUpdatesComplete(t *testing.T) {
 	}
 }
 
+// TestSessionUpdateMetaSeq verifies that agent-side session/update notifications
+// automatically carry a monotonically increasing `seq` field in their _meta
+// payload, scoped per session.
+func TestSessionUpdateMetaSeq(t *testing.T) {
+	c2aR, c2aW := io.Pipe()
+	a2cR, a2cW := io.Pipe()
+
+	type seqRecord struct {
+		Session string
+		Seq     float64
+	}
+
+	var (
+		mu   sync.Mutex
+		seen []seqRecord
+	)
+
+	_ = NewClientSideConnection(&clientFuncs{
+		SessionUpdateFunc: func(_ context.Context, n SessionNotification) error {
+			if n.Meta == nil {
+				t.Errorf("SessionNotification.Meta is nil")
+				return nil
+			}
+			v, ok := n.Meta["seq"]
+			if !ok {
+				t.Errorf("SessionNotification.Meta missing seq key")
+				return nil
+			}
+			seq, ok := v.(float64)
+			if !ok {
+				t.Errorf("SessionNotification.Meta[seq] has unexpected type %T", v)
+				return nil
+			}
+
+			// 同时校验 chunk 层级 Meta 中也带有相同的 seq
+			if n.Update.AgentMessageChunk != nil {
+				cm := n.Update.AgentMessageChunk.Meta
+				if cm == nil {
+					t.Errorf("AgentMessageChunk.Meta is nil")
+				} else if csv, ok := cm["seq"]; !ok {
+					t.Errorf("AgentMessageChunk.Meta missing seq key")
+				} else if cf, ok := csv.(float64); !ok || cf != seq {
+					t.Errorf("AgentMessageChunk.Meta[seq]=%v (type %T), want %v", csv, csv, seq)
+				}
+			}
+
+			mu.Lock()
+			seen = append(seen, seqRecord{Session: string(n.SessionId), Seq: seq})
+			mu.Unlock()
+			return nil
+		},
+	}, c2aW, a2cR)
+
+	agentSide := NewAgentSideConnection(agentFuncs{}, a2cW, c2aR)
+	ctx := context.Background()
+
+	// Send several updates for two different sessions.
+	for i := 0; i < 3; i++ {
+		if err := agentSide.SessionUpdate(ctx, SessionNotification{
+			SessionId: SessionId("s1"),
+			Update: SessionUpdate{
+				AgentMessageChunk: &SessionUpdateAgentMessageChunk{Content: TextBlock("s1")},
+			},
+		}); err != nil {
+			t.Fatalf("SessionUpdate s1[%d]: %v", i, err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if err := agentSide.SessionUpdate(ctx, SessionNotification{
+			SessionId: SessionId("s2"),
+			Update: SessionUpdate{
+				AgentMessageChunk: &SessionUpdateAgentMessageChunk{Content: TextBlock("s2")},
+			},
+		}); err != nil {
+			t.Fatalf("SessionUpdate s2[%d]: %v", i, err)
+		}
+	}
+
+	// Give the receive loop a moment to deliver notifications.
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(seen) != 5 {
+		t.Fatalf("expected 5 session updates, got %d", len(seen))
+	}
+
+	var s1, s2 []float64
+	for _, r := range seen {
+		switch r.Session {
+		case "s1":
+			s1 = append(s1, r.Seq)
+		case "s2":
+			s2 = append(s2, r.Seq)
+		}
+	}
+
+	if !slices.Equal(s1, []float64{1, 2, 3}) {
+		t.Fatalf("unexpected seq for s1: %v", s1)
+	}
+	if !slices.Equal(s2, []float64{1, 2}) {
+		t.Fatalf("unexpected seq for s2: %v", s2)
+	}
+}
+
 // TestRequestHandlerCanMakeNestedRequest verifies that a request handler can make nested
 // requests without deadlocking (e.g., Prompt handler calling RequestPermission).
 func TestRequestHandlerCanMakeNestedRequest(t *testing.T) {
